@@ -39,6 +39,7 @@ This section contains the list of all supported hardware and software devices. C
 - \subpage DeviceUltravioletPCOUVCam
 - \subpage DeviceDAQVideoSource
 - \subpage DeviceFLIRSpinnakerCam
+- \subpage DeviceSpecimCam
 - \subpage DeviceSpinnaker
 - \subpage DeviceBlackMagicDeckLink
 - \subpage DeviceAzureKinect
