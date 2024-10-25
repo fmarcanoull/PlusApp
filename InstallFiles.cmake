@@ -44,6 +44,13 @@ IF(PLUSBUILD_DOWNLOAD_PLUSLIBDATA AND EXISTS "${PLUSLIB_DATA_DIR}")
     ${PLUSLIB_DATA_DIR}/CADModels/Stylus/Stylus_Example.stl
     )
 
+  IF(PLUS_USE_SPECIM_CAM)
+    LIST(APPEND PLUSLIB_CONFIG_FILES
+      ${PLUSLIB_DATA_DIR}/ConfigFiles/PlusDeviceSet_Server_SpecimCamera.xml
+      )
+  ENDIF()
+  
+  
   IF(PLUS_USE_3dConnexion_TRACKER)
     LIST(APPEND PLUSLIB_CONFIG_FILES ${PLUSLIB_DATA_DIR}/ConfigFiles/PlusDeviceSet_Server_3dConnexion.xml)
   ENDIF()
