@@ -28,6 +28,8 @@ See License.txt for details.
 #include <QHostInfo>
 #include <QIcon>
 #include <QKeyEvent>
+#include <QMenu>
+#include <QMessageBox>
 #include <QNetworkInterface>
 #include <QProcess>
 #include <QRegExp>
@@ -68,6 +70,8 @@ namespace
   }
 }
 
+const int SYSTEM_TRAY_MESSAGE_TIMEOUT_MS = 1000;
+
 //-----------------------------------------------------------------------------
 PlusServerLauncherMainWindow::PlusServerLauncherMainWindow(QWidget* parent /*=0*/, Qt::WindowFlags flags/*=0*/, bool autoConnect /*=false*/, int remoteControlServerPort/*=RemoteControlServerPortUseDefault*/)
   : QMainWindow(parent, flags)
@@ -91,6 +95,24 @@ PlusServerLauncherMainWindow::PlusServerLauncherMainWindow(QWidget* parent /*=0*
   m_DeviceSetSelectorWidget->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::MinimumExpanding);
   m_DeviceSetSelectorWidget->SetConnectButtonText(QString("Launch server"));
   connect(m_DeviceSetSelectorWidget, SIGNAL(ConnectToDevicesByConfigFileInvoked(std::string)), this, SLOT(ConnectToDevicesByConfigFile(std::string)));
+
+  // System tray icon
+  m_SystemTrayMenu = new QMenu(this);
+  m_SystemTrayShowAction = m_SystemTrayMenu->addAction("Show Plus Server Launcher", this, SLOT(show()));
+  m_SystemTrayHideAction = m_SystemTrayMenu->addAction("Minimize to tray", this, SLOT(hide()));
+  m_SystemTrayMenu->addSeparator();
+  m_SystemTrayMenu->addAction("Open log folder", this, SLOT(OpenLogFolderClicked()));
+  m_SystemTrayMenu->addAction("Open latest log file", this, SLOT(LatestLogClicked()));
+  m_SystemTrayMenu->addSeparator();
+  m_SystemTrayMenu->addAction("Exit", this, SLOT(close()));
+
+  m_SystemTrayIcon = new QSystemTrayIcon(QIcon(":/icons/Resources/icon_ConnectLarge.ico"), this);
+  std::string plusVersionString = PlusCommon::GetPlusLibVersionString();
+  m_SystemTrayIcon->setToolTip(QString("Plus Server Launcher - %1").arg(plusVersionString.c_str()));
+  m_SystemTrayIcon->setContextMenu(m_SystemTrayMenu);
+  m_SystemTrayIcon->show();
+  connect(m_SystemTrayIcon, SIGNAL(activated(QSystemTrayIcon::ActivationReason)), this, SLOT(SystemTrayIconActivated(QSystemTrayIcon::ActivationReason)));
+  connect(m_SystemTrayIcon, SIGNAL(messageClicked()), this, SLOT(SystemTrayMessageClicked()));
 
   // Create status icon
   QPlusStatusIcon* statusIcon = new QPlusStatusIcon(NULL);
@@ -122,7 +144,7 @@ PlusServerLauncherMainWindow::PlusServerLauncherMainWindow(QWidget* parent /*=0*
   ui.centralLayout->insertWidget(0, m_DeviceSetSelectorWidget);
 
   // Log basic info (Plus version, supported devices)
-  std::string strPlusLibVersion = std::string(" Software version: ") + PlusCommon::GetPlusLibVersionString();
+  std::string strPlusLibVersion = std::string(" Software version: ") + plusVersionString;
   LOG_INFO(strPlusLibVersion);
   LOG_INFO("Logging at level " << vtkPlusLogger::Instance()->GetLogLevel() << " to file: " << vtkPlusLogger::Instance()->GetLogFileName());
   vtkSmartPointer<vtkPlusDeviceFactory> deviceFactory = vtkSmartPointer<vtkPlusDeviceFactory>::New();
@@ -275,6 +297,34 @@ PlusStatus PlusServerLauncherMainWindow::ReadConfiguration()
   applicationConfigurationRoot->GetScalarAttribute("CurrentTab", currentTab);
   ui.tabWidget->setCurrentIndex(currentTab);
 
+  const char* hideOnStartupValue = applicationConfigurationRoot->GetAttribute("HideOnStartup");
+  bool hideOnStartup = false;
+  if (hideOnStartupValue && STRCASECMP(hideOnStartupValue, "True") == 0)
+  {
+    hideOnStartup = true;
+  }
+  ui.checkBox_startMinimized->setChecked(hideOnStartup);
+
+  const char* showNotificationsValue = applicationConfigurationRoot->GetAttribute("ShowNotifications");
+  bool showNotifications = true;
+  if (showNotificationsValue && STRCASECMP(showNotificationsValue, "True") == 0)
+  {
+    showNotifications = true;
+  }
+  else
+  {
+    showNotifications = false;
+  }
+  ui.checkBox_showNotifications->setChecked(showNotifications);
+
+  const char* minimizeOnCloseValue = applicationConfigurationRoot->GetAttribute("MinimizeOnClose");
+  bool minimizeOnClose = false;
+  if (minimizeOnCloseValue && STRCASECMP(minimizeOnCloseValue, "True") == 0)
+  {
+    minimizeOnClose = true;
+  }
+  ui.checkBox_minimizeOnClose->setChecked(minimizeOnClose);
+
   return PLUS_SUCCESS;
 }
 
@@ -291,6 +341,9 @@ PlusStatus PlusServerLauncherMainWindow::WriteConfiguration()
   }
 
   applicationConfigurationRoot->SetIntAttribute("CurrentTab", ui.tabWidget->currentIndex());
+  applicationConfigurationRoot->SetAttribute("HideOnStartup", ui.checkBox_startMinimized->isChecked() ? "True" : "False");
+  applicationConfigurationRoot->SetAttribute("ShowNotifications", ui.checkBox_showNotifications->isChecked() ? "True" : "False");
+  applicationConfigurationRoot->SetAttribute("MinimizeOnClose", ui.checkBox_minimizeOnClose->isChecked() ? "True" : "False");
 
   // Write configuration to file
   igsioCommon::XML::PrintXML(applicationConfigurationFilePath.c_str(), applicationConfigurationRoot);
@@ -330,6 +383,7 @@ bool PlusServerLauncherMainWindow::StartServer(const QString& configFilePath, in
 
   // During waitForFinished an error signal may be emitted, which may delete newServerProcess,
   // therefore we need to check if the current server process still exists
+  QString baseFileName = QString::fromStdString(vtksys::SystemTools::GetFilenameName(configFilePath.toStdString()));
   if (GetServerInfoFromID(newServerInfo.ID).Process &&
     newServerProcess && newServerProcess->state() == QProcess::Running)
   {
@@ -338,11 +392,17 @@ bool PlusServerLauncherMainWindow::StartServer(const QString& configFilePath, in
     connect(newServerInfo.Process, SIGNAL(readyReadStandardError()), this, SLOT(StdErrMsgReceived()));
     ui.comboBox_LogLevel->setEnabled(false);
     UpdateRemoteServerTable();
+
+    ShowNotification(QString("Configuration file: %1").arg(baseFileName), "Server starting");
+
     return true;
   }
   else
   {
     LOG_ERROR("Failed to start server process");
+
+    ShowNotification(QString("Configuration file: %1").arg(baseFileName), "Failed to start server");
+
     return false;
   }
 }
@@ -505,11 +565,6 @@ bool PlusServerLauncherMainWindow::StopServer(const QString& configFilePath)
     return true;
   }
 
-  disconnect(process, SIGNAL(readyReadStandardOutput()), this, SLOT(StdOutMsgReceived()));
-  disconnect(process, SIGNAL(readyReadStandardError()), this, SLOT(StdErrMsgReceived()));
-  disconnect(process, SIGNAL(error(QProcess::ProcessError)), this, SLOT(ErrorReceived(QProcess::ProcessError)));
-  disconnect(process, SIGNAL(finished(int, QProcess::ExitStatus)), this, SLOT(ServerExecutableFinished(int, QProcess::ExitStatus)));
-
   bool forcedShutdown = false;
   if (process->state() == QProcess::Running)
   {
@@ -539,8 +594,13 @@ bool PlusServerLauncherMainWindow::StopServer(const QString& configFilePath)
     ui.comboBox_LogLevel->setEnabled(true);
   }
 
-  delete process;
+  disconnect(process, SIGNAL(readyReadStandardOutput()), this, SLOT(StdOutMsgReceived()));
+  disconnect(process, SIGNAL(readyReadStandardError()), this, SLOT(StdErrMsgReceived()));
+  disconnect(process, SIGNAL(error(QProcess::ProcessError)), this, SLOT(ErrorReceived(QProcess::ProcessError)));
+  disconnect(process, SIGNAL(finished(int, QProcess::ExitStatus)), this, SLOT(ServerExecutableFinished(int, QProcess::ExitStatus)));
+
   RemoveServerProcess(process);
+  delete process;
 
   if (m_RemoteControlServerConnector)
   {
@@ -573,31 +633,46 @@ bool PlusServerLauncherMainWindow::LocalStopServer()
 void PlusServerLauncherMainWindow::ParseContent(const std::string& message)
 {
   QProcess* process = qobject_cast<QProcess*>(QObject::sender());
-  if (process)
+  if (!process)
   {
-    ServerInfo info = GetServerInfoFromProcess(process);
-    if (info.Filename != vtksys::SystemTools::GetFilenameName(m_LocalConfigFile))
-    {
-      return;
-    }
+    return;
   }
+
+  bool localConfigFile = true;
+  ServerInfo info = GetServerInfoFromProcess(process);
+  if (info.Filename != vtksys::SystemTools::GetFilenameName(m_LocalConfigFile))
+  {
+    localConfigFile = false;
+  }
+
   // Input is the format: message
   // Plus OpenIGTLink server listening on IPs: 169.254.100.247, 169.254.181.13, 129.100.44.163, 192.168.199.1, 192.168.233.1, 127.0.0.1 -- port 18944
   if (message.find("Plus OpenIGTLink server listening on IPs:") != std::string::npos)
   {
-    m_Suffix.append(message);
-    m_Suffix.append("\n");
-    m_DeviceSetSelectorWidget->SetDescriptionSuffix(QString(m_Suffix.c_str()));
+    if (localConfigFile)
+    {
+      m_Suffix.append(message);
+      m_Suffix.append("\n");
+      m_DeviceSetSelectorWidget->SetDescriptionSuffix(QString(m_Suffix.c_str()));
+    }
   }
   else if (message.find("Server status: Server(s) are running.") != std::string::npos)
   {
-    m_DeviceSetSelectorWidget->SetConnectionSuccessful(true);
-    m_DeviceSetSelectorWidget->SetConnectButtonText(QString("Stop server"));
+    if (localConfigFile)
+    {
+      m_DeviceSetSelectorWidget->SetConnectionSuccessful(true);
+      m_DeviceSetSelectorWidget->SetConnectButtonText(QString("Stop server"));
+    }
+
+    ShowNotification(QString("Configuration file: %1").arg(info.Filename.c_str()), "Server started");
   }
   else if (message.find("Server status: ") != std::string::npos)
   {
-    // pull off server status and display it
-    m_DeviceSetSelectorWidget->SetDescriptionSuffix(QString(message.c_str()));
+    if (localConfigFile)
+    {
+      // pull off server status and display it
+      m_DeviceSetSelectorWidget->SetDescriptionSuffix(QString(message.c_str()));
+    }
   }
 }
 
@@ -638,7 +713,10 @@ void PlusServerLauncherMainWindow::ConnectToDevicesByConfigFile(std::string aCon
   {
     LOG_INFO("Disconnect request successful");
     m_DeviceSetSelectorWidget->ClearDescriptionSuffix();
-    m_DeviceSetSelectorWidget->SetConnectionSuccessful(false);
+    if (m_DeviceSetSelectorWidget->GetConnectionSuccessful())
+    {
+      m_DeviceSetSelectorWidget->SetConnectionSuccessful(false);
+    }
     m_DeviceSetSelectorWidget->SetConnectButtonText(QString("Launch server"));
     return;
   }
@@ -862,18 +940,21 @@ void PlusServerLauncherMainWindow::ErrorReceived(QProcess::ProcessError errorCod
 //-----------------------------------------------------------------------------
 void PlusServerLauncherMainWindow::ServerExecutableFinished(int returnCode, QProcess::ExitStatus status)
 {
+  QProcess* finishedProcess = dynamic_cast<QProcess*>(sender());
+  ServerInfo info = GetServerInfoFromProcess(finishedProcess);
+  std::string configFileName = info.Filename;
+
   if (returnCode == 0)
   {
     LOG_INFO("Server process terminated.");
+    ShowNotification(QString("Configuration file: %1").arg(configFileName.c_str()), "Server stopped");
   }
   else
   {
     LOG_ERROR("Server stopped unexpectedly. Return code: " << returnCode);
+    ShowNotification(QString("Configuration file: %1").arg(configFileName.c_str()), "Server stopped unexpectedly");
   }
 
-  QProcess* finishedProcess = dynamic_cast<QProcess*>(sender());
-  ServerInfo info = GetServerInfoFromProcess(finishedProcess);
-  std::string configFileName = info.Filename;
   if (finishedProcess)
   {
     RemoveServerProcess(finishedProcess);
@@ -883,7 +964,10 @@ void PlusServerLauncherMainWindow::ServerExecutableFinished(int returnCode, QPro
   {
     ConnectToDevicesByConfigFile("");
     ui.comboBox_LogLevel->setEnabled(true);
-    m_DeviceSetSelectorWidget->SetConnectionSuccessful(false);
+    if (m_DeviceSetSelectorWidget->GetConnectionSuccessful())
+    {
+      m_DeviceSetSelectorWidget->SetConnectionSuccessful(false);
+    }
   }
 
   SendServerStoppedCommand(info);
@@ -904,7 +988,7 @@ void PlusServerLauncherMainWindow::LatestLogClicked()
   QFileInfoList fileInfoList = directory.entryInfoList(QStringList() << "*.txt");
   if (fileInfoList.isEmpty())
   {
-    this->LocalLog(vtkPlusLogger::LOG_LEVEL_INFO, "No logs in output directory.");
+    LocalLog(vtkPlusLogger::LOG_LEVEL_INFO, "No logs in output directory.");
     return;
   }
 
@@ -938,6 +1022,17 @@ void PlusServerLauncherMainWindow::LatestLogClicked()
   if (!QDesktopServices::openUrl(QUrl("file:///" + latestInfo.absoluteFilePath(), QUrl::TolerantMode)))
   {
     LOG_ERROR("Failed to open file in default application: " << latestInfo.absoluteFilePath().toStdString());
+  }
+}
+
+//----------------------------------------------------------------------------
+void PlusServerLauncherMainWindow::OpenLogFolderClicked()
+{
+  // Open the output folder
+  QDir directory(QString::fromStdString(vtkPlusConfig::GetInstance()->GetOutputDirectory()));
+  if (!QDesktopServices::openUrl(QUrl("file:///" + directory.absolutePath(), QUrl::TolerantMode)))
+  {
+    LOG_ERROR("Failed to open folder in default application: " << directory.absolutePath().toStdString());
   }
 }
 
@@ -1490,8 +1585,11 @@ void PlusServerLauncherMainWindow::OnLogEvent(vtkObject* caller, unsigned long e
 
   if (!logMessage.isEmpty())
   {
-
+#if (QT_VERSION >= QT_VERSION_CHECK(5,14,0))
+    QStringList tokens = logMessage.split('|', Qt::SkipEmptyParts);
+#else
     QStringList tokens = logMessage.split('|', QString::SkipEmptyParts);
+#endif
     if (tokens.size() > 0)
     {
       std::string logLevel = tokens[0].toStdString();
@@ -1583,4 +1681,79 @@ std::string PlusServerLauncherMainWindow::GetServersFromConfigFile(std::string f
 
   }
   return ports;
+}
+
+//---------------------------------------------------------------------------
+void PlusServerLauncherMainWindow::closeEvent(QCloseEvent* event)
+{
+  QApplication* app = qobject_cast<QApplication*>(QApplication::instance());
+  app->setQuitOnLastWindowClosed(true);
+
+  if (!event->spontaneous() || !isVisible())
+  {
+    return;
+  }
+
+  if (ui.checkBox_minimizeOnClose->isChecked())
+  {
+    app->setQuitOnLastWindowClosed(false);
+    QMessageBox::information(this, tr("Plus Server Launcher"),
+      tr("The program will keep running in the "
+        "system tray. To terminate the program, "
+        "right-click on the system tray icon and "
+        "choose <b>Exit</b>."));
+  }
+}
+
+//-----------------------------------------------------------------------------
+bool PlusServerLauncherMainWindow::GetHideOnStartup() const
+{
+  return ui.checkBox_startMinimized->isChecked();
+}
+
+//---------------------------------------------------------------------------
+void PlusServerLauncherMainWindow::ShowNotification(QString message, QString title)
+{
+  if (!ui.checkBox_showNotifications->isChecked())
+  {
+    return;
+  }
+
+#if (QT_VERSION >= QT_VERSION_CHECK(5,9,0))
+  m_SystemTrayIcon->showMessage(
+    title,
+    message,
+    m_SystemTrayIcon->icon(),
+    SYSTEM_TRAY_MESSAGE_TIMEOUT_MS);
+#else
+  m_SystemTrayIcon->showMessage(
+    title,
+    message,
+    QSystemTrayIcon::Information,
+    SYSTEM_TRAY_MESSAGE_TIMEOUT_MS);
+#endif
+}
+
+//---------------------------------------------------------------------------
+void PlusServerLauncherMainWindow::SystemTrayIconActivated(QSystemTrayIcon::ActivationReason reason)
+{
+  if (reason == QSystemTrayIcon::ActivationReason::Context)
+  {
+    m_SystemTrayShowAction->setVisible(!isVisible());
+    m_SystemTrayHideAction->setVisible(isVisible());
+  }
+  else
+  {
+    show();
+    raise();
+    activateWindow();
+  }
+}
+
+//---------------------------------------------------------------------------
+void PlusServerLauncherMainWindow::SystemTrayMessageClicked()
+{
+  show();
+  raise();
+  activateWindow();
 }
